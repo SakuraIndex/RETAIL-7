@@ -1,8 +1,9 @@
-# src/retail7_snapshot.py  — 完全版（5m→日足フォールバック付き）
+# src/retail7_snapshot.py — 完全版（Open/Close をどの列順でも取得・5m→日足フォールバック）
+
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -14,11 +15,11 @@ KEY = "RETAIL-7"
 OUTPUT_DIR = Path("docs/outputs")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# 画像で指定の7社（Yahoo!Finance ティッカー）
+# 構成銘柄（Yahoo!Finance ティッカー）
 TICKERS: Dict[str, str] = {
     "イオン": "8267.T",
     "ファーストリテイリング": "9983.T",
-    "PPIH": "7532.T",       # PPIF→PPIH 読み替え
+    "PPIH": "7532.T",       # PPIF→PPIH に読み替え
     "セブン＆アイ": "3382.T",
     "三越伊勢丹": "3099.T",
     "トライアルHD": "141A.T",
@@ -55,37 +56,69 @@ def _as_series(obj) -> Optional[pd.Series]:
     return None
 
 
-def _pick_close_series(df: pd.DataFrame) -> Optional[pd.Series]:
-    """終値列を安全に Series 化（単一列/MultiIndex 両対応）"""
+def _extract_field_anyorder(df: pd.DataFrame, field: str) -> Optional[pd.Series]:
+    """
+    df.columns が
+      - 単一列:  ['Open','High',...]
+      - MultiIndex: [(ticker, 'Open'), ...] もしくは [('Open', ticker), ...]
+    のいずれでも、指定 field（'Open' / 'Close' / 'Adj Close'）を取り出す。
+    """
     if df is None or df.empty:
         return None
 
+    # 単一列
+    if not isinstance(df.columns, pd.MultiIndex):
+        if field in df.columns:
+            s = _as_series(df[[field]])
+            return pd.to_numeric(s, errors="coerce") if s is not None else None
+        return None
+
+    # MultiIndex: 任意のレベル順で field を含む列を抽出
+    mask = []
+    for col in df.columns:
+        if isinstance(col, tuple) and any(str(level) == field for level in col):
+            mask.append(True)
+        else:
+            mask.append(False)
+
+    if any(mask):
+        sub = df.loc[:, mask]
+        s = _as_series(sub)
+        return pd.to_numeric(s, errors="coerce") if s is not None else None
+    return None
+
+
+def _pick_close_series(df: pd.DataFrame) -> Optional[pd.Series]:
+    """5分足側の終値列抽出（MultiIndex/単一列対応）。"""
+    if df is None or df.empty:
+        return None
+
+    # 単一列
     if not isinstance(df.columns, pd.MultiIndex):
         for cand in ["Close", "Adj Close", "close", "AdjClose"]:
             if cand in df.columns:
                 s = _as_series(df[cand])
                 return pd.to_numeric(s, errors="coerce") if s is not None else None
 
-    if isinstance(df.columns, pd.MultiIndex):
-        for cand in ["Close", "Adj Close"]:
-            mask = np.array([t[-1] == cand for t in df.columns])
-            if mask.any():
-                sub = df.loc[:, mask]
-                s = _as_series(sub)
-                if s is not None and not s.empty:
-                    return pd.to_numeric(s, errors="coerce")
-
+    # MultiIndex
+    for cand in ["Close", "Adj Close"]:
+        cols = [i for i, c in enumerate(df.columns)
+                if isinstance(c, tuple) and any(str(level) == cand for level in c)]
+        if cols:
+            sub = df.iloc[:, cols]
+            s = _as_series(sub)
+            if s is not None and not s.empty:
+                return pd.to_numeric(s, errors="coerce")
     return None
 
 
 def _download_series_5m(ticker: str) -> pd.Series:
-    """5分足終値 Series（UTC index）。空なら長さ0のSeries。"""
     df = yf.download(
         ticker,
         period="30d",
         interval="5m",
         auto_adjust=False,
-        group_by="column",
+        group_by="column",      # 単一列化を優先（環境差でMultiになる場合もある）
         progress=False,
         threads=True,
     )
@@ -102,8 +135,8 @@ def _download_series_5m(ticker: str) -> pd.Series:
 
 def _fallback_daily_series(ticker: str) -> pd.Series:
     """
-    5mが取れない場合のフォールバック：
-    直近営業日の始値・終値から 2点の“擬似 intraday”を合成（JST 09:00 と 15:00）。
+    5分足が取れない場合のフォールバック：
+      直近営業日の Open/Close から JST 09:00/15:00 の2点時系列を合成。
     """
     df = yf.download(
         ticker,
@@ -116,60 +149,67 @@ def _fallback_daily_series(ticker: str) -> pd.Series:
     if df is None or df.empty:
         return pd.Series(dtype=float)
 
-    # 列の取り出し（MultiIndex/単一列両対応）
-    if isinstance(df.columns, pd.MultiIndex):
-        get = lambda col: _as_series(df.loc[:, pd.IndexSlice[:, col]])
-    else:
-        get = lambda col: _as_series(df[[col]])
-
-    s_open = get("Open")
-    s_close = get("Close")
-    if s_open is None or s_close is None or s_open.dropna().empty or s_close.dropna().empty:
+    s_open  = _extract_field_anyorder(df, "Open")
+    s_close = _extract_field_anyorder(df, "Close")
+    if s_open is None or s_close is None:
+        return pd.Series(dtype=float)
+    s_open, s_close = s_open.dropna(), s_close.dropna()
+    if s_open.empty or s_close.empty:
         return pd.Series(dtype=float)
 
-    last_day = s_close.dropna().index[-1]  # UTC の日付Index
-    # JST で 09:00 と 15:00 を作る
-    day_jst = pd.Timestamp(last_day).tz_localize("UTC").tz_convert(TZ_JST).normalize()
-    t_open = day_jst + pd.Timedelta(hours=9)
+    # 直近日のインデックス（yfinanceはUTC naive or tzなし→UTC想定）
+    last_day = s_close.index[-1]
+    last_day = pd.to_datetime(last_day).tz_localize("UTC") if pd.Timestamp(last_day).tzinfo is None else pd.Timestamp(last_day).tz_convert("UTC")
+
+    # JST 09:00 / 15:00
+    day_jst = last_day.tz_convert(TZ_JST).normalize()
+    t_open  = day_jst + pd.Timedelta(hours=9)
     t_close = day_jst + pd.Timedelta(hours=15)
 
-    open_val = float(s_open.loc[last_day])
-    close_val = float(s_close.loc[last_day])
+    try:
+        open_val  = float(s_open.loc[last_day])
+        close_val = float(s_close.loc[last_day])
+    except KeyError:
+        # インデックスの微小差異(naive/aware)対策：日付同士で揃える
+        s_open_d  = s_open.copy()
+        s_close_d = s_close.copy()
+        s_open_d.index  = pd.to_datetime(s_open_d.index).tz_localize("UTC", nonexistent="shift_forward", ambiguous="NaT")
+        s_close_d.index = pd.to_datetime(s_close_d.index).tz_localize("UTC", nonexistent="shift_forward", ambiguous="NaT")
+        open_val  = float(s_open_d.iloc[-1])
+        close_val = float(s_close_d.iloc[-1])
+
     if not (np.isfinite(open_val) and np.isfinite(close_val) and open_val > 0):
         return pd.Series(dtype=float)
 
-    idx = pd.DatetimeIndex([t_open, t_close]).tz_convert("UTC")  # 統一してUTC indexへ
+    idx_utc = pd.DatetimeIndex([t_open, t_close]).tz_convert("UTC")
     vals = [open_val, close_val]
-    return pd.Series(vals, index=idx, name=ticker)
+    return pd.Series(vals, index=idx_utc, name=ticker)
 
 
 def _latest_session_slice(df_close_jst: pd.DataFrame) -> pd.DataFrame:
-    """当日が空なら直近営業日の1日分を返す。"""
+    """当日が空なら直近営業日の1日分を返す（2点フォールバックも可）。"""
     if df_close_jst.empty:
         return df_close_jst
 
     today = pd.Timestamp.now(TZ_JST).normalize()
-    m_today = (df_close_jst.index >= today) & (df_close_jst.index < today + pd.Timedelta(days=1))
-    today_df = df_close_jst.loc[m_today]
+    today_df = df_close_jst[(df_close_jst.index >= today) &
+                            (df_close_jst.index <  today + pd.Timedelta(days=1))]
     if not today_df.empty:
         return today_df
 
+    # 直近で2点以上ある日を使用
     g = df_close_jst.groupby(df_close_jst.index.tz_convert(TZ_JST).date)
-    eligible = [d for d, x in g if len(x.dropna(how="all")) >= 2]  # フォールバックは2点なので>=2でOK
+    eligible = [d for d, x in g if len(x.dropna(how="all")) >= 2]
     if not eligible:
         return pd.DataFrame(index=[], columns=df_close_jst.columns)
-
     last_date = max(eligible)
     last_day = pd.Timestamp(last_date, tz=TZ_JST)
-    return df_close_jst.loc[(df_close_jst.index >= last_day) &
-                            (df_close_jst.index < last_day + pd.Timedelta(days=1))]
+    return df_close_jst[(df_close_jst.index >= last_day) &
+                        (df_close_jst.index <  last_day + pd.Timedelta(days=1))]
 
 
 def build_intraday_series() -> pd.DataFrame:
-    """
-    等金額加重“対始値騰落率(%)”の時系列。
-    5分足を優先し、銘柄ごとに取得不可なら日足から擬似 intraday を合成して補完。
-    """
+    # 5分足優先で取得、だめな銘柄は日足フォールバック
     s_map: Dict[str, pd.Series] = {}
     for tic in TICKER_LIST:
         s5 = _download_series_5m(tic)
@@ -183,7 +223,6 @@ def build_intraday_series() -> pd.DataFrame:
     if not s_map:
         raise RuntimeError("no prices at all")
 
-    # JST に揃えて横持ち
     df_close = pd.DataFrame(s_map).sort_index()
     df_close_jst = df_close.tz_convert(TZ_JST)
 
@@ -191,7 +230,7 @@ def build_intraday_series() -> pd.DataFrame:
     if ses.empty:
         raise RuntimeError("no prices for today (ET)")
 
-    # 始値（最初の非NaN）で規格化し、等金額加重の平均％
+    # 始値で正規化 → 等金額加重(%)
     open_prices = ses.apply(lambda s: s.dropna().iloc[0] if s.dropna().size else np.nan)
     valid_cols = [c for c in ses.columns if np.isfinite(open_prices.get(c, np.nan)) and open_prices.get(c, np.nan) > 0]
     if not valid_cols:
