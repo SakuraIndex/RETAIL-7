@@ -1,52 +1,89 @@
-# coding: utf-8
-import os, json
-from datetime import timezone, timedelta
-import pandas as pd
+# scripts/make_intraday_chart.py  — 完全版（列名自動検出 & ダークスタイル）
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 
-OUT_DIR = "docs/outputs"
-CSV = os.path.join(OUT_DIR, "retail_7_intraday.csv")
-STATS = os.path.join(OUT_DIR, "retail_7_stats.json")
-PNG = os.path.join(OUT_DIR, "retail_7_intraday.png")
+OUTPUT_DIR = Path("docs/outputs")
+CSV_PATH   = OUTPUT_DIR / "retail_7_intraday.csv"
+PNG_PATH   = OUTPUT_DIR / "retail_7_intraday.png"
 
-JST = timezone(timedelta(hours=9))
+TITLE = "RETAIL-7 Intraday Snapshot (JST)"
 
-def load():
-    df = pd.read_csv(CSV)
-    # 既にJST文字列 → pandasに食わせる
-    df["datetime_jst"] = pd.to_datetime(df["datetime_jst"])
-    df = df.set_index("datetime_jst")
-    with open(STATS, "r", encoding="utf-8") as f:
-        s = json.load(f)
-    return df, s
+def load_series() -> pd.Series:
+    if not CSV_PATH.exists():
+        raise FileNotFoundError(f"CSV not found: {CSV_PATH}")
+
+    df = pd.read_csv(CSV_PATH, index_col=0, parse_dates=True)
+    # 列名を自動検出（古いスクリプト互換）
+    cand_cols = ["retail7_pct", "pct"]
+    col = next((c for c in cand_cols if c in df.columns), None)
+    if col is None:
+        raise KeyError(f"No target column found in {CSV_PATH}. tried={cand_cols}, actual={list(df.columns)}")
+
+    s = pd.to_numeric(df[col], errors="coerce").dropna()
+    # index は JST（retail7_snapshot.py で JST を保存）→ そのまま使用
+    s.index.name = "datetime_jst"
+    return s
+
+def plot(s: pd.Series) -> None:
+    # スタイル（黒ベース）
+    plt.rcParams.update({
+        "figure.figsize": (16, 9),
+        "figure.dpi": 160,
+        "axes.facecolor": "#0b1420",
+        "figure.facecolor": "#0b1420",
+        "axes.edgecolor": "#2a3a4a",
+        "text.color": "#d4e9f7",
+        "axes.labelcolor": "#cfe6f3",
+        "xtick.color": "#9fb6c7",
+        "ytick.color": "#9fb6c7",
+        "grid.color": "#1c2a3a",
+        "grid.linestyle": "-",
+        "grid.alpha": 0.35,
+    })
+
+    fig, ax = plt.subplots()
+
+    y = s.copy()
+    x = y.index
+
+    color_up   = "#22d3ee"   # ティール
+    color_down = "#fb7185"   # サーモン
+    line_color = color_up if y.iloc[-1] >= 0 else color_down
+    fill_color = (*matplotlib.colors.to_rgba(line_color)[:3], 0.18)
+
+    ax.plot(x, y.values, linewidth=2.2, color=line_color)
+    ax.fill_between(x, np.minimum(y.values, 0), y.values, where=y.values>=0,
+                    color=fill_color, interpolate=True)
+    ax.fill_between(x, y.values, np.minimum(y.values, 0), where=y.values<0,
+                    color=fill_color, interpolate=True)
+
+    ax.axhline(0, color="#2a3a4a", linewidth=1.2)
+    ax.grid(True, axis="both")
+
+    ax.set_title(TITLE, fontsize=16, weight="bold")
+    ax.set_ylabel("Change vs Open (%)")
+    ax.set_xlabel("")
+
+    # 余白
+    fig.tight_layout()
+    PNG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(PNG_PATH, bbox_inches="tight")
+    plt.close(fig)
 
 def main():
-    df, s = load()
-    pct = float(s.get("pct_intraday") or 0.0)
-    # 線の色（上げ=ややエメラルド / 下げ=ややピンク）
-    color = "#34d399" if pct >= 0 else "#fb7185"
-
-    plt.figure(figsize=(14, 6), dpi=140)
-    ax = plt.gca()
-    ax.set_facecolor("#0b1420")
-    plt.rcParams["savefig.facecolor"] = "#0b1420"
-
-    x = df.index
-    y = df["retail7_pct"]
-
-    ax.plot(x, y, linewidth=2.0, color="#60f0e0")  # 線は青緑で統一
-    ax.fill_between(x, y, 0, where=(y>=0), alpha=0.18, color="#10b981")
-    ax.fill_between(x, y, 0, where=(y<0),  alpha=0.18, color="#ef4444")
-
-    ax.grid(color="#1c2a3a", alpha=0.6)
-    ax.spines[:].set_color("#1c2a3a")
-    ax.tick_params(colors="#cfe6f3")
-    ax.set_ylabel("Change vs Open (%)", color="#cfe6f3")
-    ax.set_title(f"RETAIL-7 Intraday Snapshot ({pd.Timestamp.now(tz=JST).strftime('%Y/%m/%d %H:%M JST')})",
-                 color="#d4e9f7", fontweight="bold")
-
-    plt.savefig(PNG, bbox_inches="tight")
-    plt.close()
+    s = load_series()
+    if s.empty:
+        raise RuntimeError("No data to plot.")
+    plot(s)
 
 if __name__ == "__main__":
     main()
