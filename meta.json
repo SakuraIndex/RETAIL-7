@@ -1,0 +1,21 @@
+{
+  "index_key": "RETAIL-7",
+  "label": "RETAIL-7",
+  "category": "国内小売",
+  "description": "日本の主要小売セクターから7銘柄をセレクト。GMS/ファストファッション/総合小売/ディスカウント等を横断的にカバー。",
+  "method": {
+    "weighting": "equal",
+    "rebalancing": "semiannual",
+    "calc": "intraday percent vs prev_close",
+    "notes": "大型/成長のバランスを優先したセレクト。"
+  },
+  "components": [
+    { "ticker": "8267", "exchange": "TSE Prime", "name_ja": "イオン", "weight": 0.1429 },
+    { "ticker": "9983", "exchange": "TSE Prime", "name_ja": "ファーストリテイリング", "weight": 0.1429 },
+    { "ticker": "7532", "exchange": "TSE Prime", "name_ja": "パン・パシフィック・インターナショナルHD", "weight": 0.1429 },
+    { "ticker": "3382", "exchange": "TSE Prime", "name_ja": "セブン＆アイ・ホールディングス", "weight": 0.1429 },
+    { "ticker": "3099", "exchange": "TSE Prime", "name_ja": "三越伊勢丹ホールディングス", "weight": 0.1429 },
+    { "ticker": "141A", "exchange": "TSE Growth", "name_ja": "トライアルホールディングス", "weight": 0.1429, "note": "グロース市場 銘柄コード末尾A" },
+    { "ticker": "8233", "exchange": "TSE Prime", "name_ja": "高島屋", "weight": 0.1429 }
+  ]
+}
