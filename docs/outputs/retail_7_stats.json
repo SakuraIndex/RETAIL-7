@@ -1,9 +1,9 @@
 {
   "key": "RETAIL-7",
-  "pct_intraday": -0.83,
-  "updated_at": "2026/02/09 13:20",
+  "pct_intraday": -0.64,
+  "updated_at": "2026/02/09 14:40",
   "unit": "pct",
-  "last_level": 991.7,
+  "last_level": 993.64,
   "tickers": [
     "8267.T",
     "9983.T",
